@@ -6,9 +6,9 @@ the admin privilege of Windows is required.
 (Open WSL2 terminal with "Run as Administrator".)
 
 # Requirements
-- ipcalc
+- iproute2 (`ip`), util-linux (`column`)
 - bash >= 4.0
-- sshuttle == 1.1.1
+- sshuttle >= 1.1.1 (tested with 1.3.x)
 
 # Installation
 ```bash
@@ -33,6 +33,14 @@ And it excludes 'IP address of ssh-server' too by specifying
 
 ```bash
 wsshuttle -r ssh-server -x 157.0.0.0/8 0/0
+```
+
+The same with the long option (short `-x`/`-r`/`-l`/`-e`/`-i` and long
+`--exclude`/`--include`/`--listen`/`--remote`/`--ssh-cmd` are both recognized
+for routing):
+
+```bash
+wsshuttle -r ssh-server --exclude 157.0.0.0/8 0/0
 ```
 
 Disables the feature of auto specifying -x 'IP address of ssh-server'.

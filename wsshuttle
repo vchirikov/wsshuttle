@@ -29,6 +29,10 @@ EXAMPLES
         Route all (0/0) packets through ssh-server except destination is
         157.0.0.0/8. And it excludes 'IP address of ssh-server' too by
         specifying -x 'IP address of ssh-server' automatically.
+    wsshuttle -r ssh-server --exclude 157.0.0.0/8 0/0
+        Same as above, but with the long option '--exclude'.
+        Short (-x, -r, -l, -e, -i) and long (--exclude, --include, --listen,
+        --remote, --ssh-cmd) options are both recognized for routing.
     wsshuttle -r ssh-server -x 157.0.0.0/8 0/0 --delete
         Deletes the entries of the routing table.
     wsshuttle -r ssh-server -x 157.0.0.0/8 0/0 --dry
@@ -54,69 +58,91 @@ parse_args(){
             IS_DELETE=1
         elif [[ $i = --dry ]]; then
             IS_DRY=1
-        elif [[ $i = --noresolve ]]; then
-            IS_NORESOLVE=1
         else
             args+=("$i")
         fi
     done
-    #show IS_DELETE IS_DRY IS_NORESOLVE args
+    #show IS_DELETE IS_DRY args
+}
 
-    IS_NORESOLVE=1
-    [[ $IS_NORESOLVE = 1 ]] && return
+check_deps(){
+    local deps=(ip column route.exe arp.exe)
+    [[ $IS_DRY = 1 ]] || deps+=(sshuttle powershell.exe)
 
-    for((i = 1; i < ${#args[@]}; i++)); do
-        if [[ ${args[$i-1]} =~ ^-[^-]*r$ ]]; then # -r
-            ssh=$(ssh -v ${args[$i]} true 2>&1 | tr -d '\r' | tr -s ' ')
-            break
-        fi
+    for i in "${deps[@]}"; do
+        command -v $i &>/dev/null || {
+            echo "error: '$i' not found." >&2
+            [[ $i = *.exe ]] &&
+                echo 'WSL interop may be disabled (appendWindowsPath).' >&2
+            exit 1
+        }
     done
-    #echo "$ssh";exit
-
-    [[ $i = ${#args[@]} ]] && return
-
-    while true; do
-        pc=$(
-            echo "$ssh" |
-            grep 'Executing proxy command:' |
-            cut -d' ' -f6- |
-            perl -pe 's/^(ssh.* -[^- ]*)W [^ ]+/\1v/' | # -W %h:%p -> -v
-            cat
-        )
-        #echo ,$pc,
-        [[ -z $pc ]] && break
-        ssh=$($pc true 2>&1 | tr -d '\r' | tr -s ' ') ||
-        { echo error: $pc failed; exit 1; }
-    done
-    rhost=$(echo "$ssh" | awk -F'[][]' '/Authenticated/{print $2}')
-    rip=$(dig +short $rhost | head -n1)
-    #show rhost rip
 }
 
 set_xs(){
-    x=($rip); s=()
-    for((i = 1; i < ${#args[@]}; i++)); do
-        if [[ ${args[$i-1]} =~ ^-[^-]*x$ ]]; then # -x
-            x+=("${args[$i]}")
-        elif [[ ! ${args[$i-1]} =~ ^-[^-]*[elr] ]]; then # not -e -l -r
-            if [[ ${args[$i]} =~ ^[0-9] ]]; then
-                s+=("${args[$i]}")
-            fi
+    x=(); s=()
+    for((i = 0; i < ${#args[@]}; i++)); do
+        a=${args[$i]}
+        p=
+        ((i > 0)) && p=${args[$i-1]}
+
+        if [[ $p =~ ^-[^-]*x$ || $p = --exclude ]]; then # value of -x/--exclude
+            x+=("$a"); continue
+        fi
+        if [[ $p =~ ^-[^-]*i$ || $p = --include ]]; then # value of -i/--include
+            s+=("$a"); continue
+        fi
+        if [[ $p =~ ^-[^-]*[elr]$ ]] ||
+           [[ $p =~ ^--(listen|remote|ssh-cmd|to-ns|method|pidfile|latency-buffer-size|exclude-from|include-from)$ ]]; then
+            continue # value of an option which takes no subnet
+        fi
+
+        if [[ $a =~ ^--exclude=(.+) ]]; then
+            x+=("${BASH_REMATCH[1]}")
+        elif [[ $a =~ ^--include=(.+) ]]; then
+            s+=("${BASH_REMATCH[1]}")
+        elif [[ $a =~ ^--(listen|remote|ssh-cmd|to-ns|method|pidfile|latency-buffer-size|exclude-from|include-from)= ]]; then
+            :
+        elif [[ $a =~ ^[0-9] ]]; then
+            s+=("$a") # positional subnet
         fi
     done
     #show x s # 8.8.8.8[/24]
 
     f() {
+        local i addr bits o n a mask m ia im na
         for i in "$@"; do # 8.8.8.8[/24]
-            ipcalc "$i" 32 | # 8.8.8.8[/24] 32
-            awk '
-                $1=="Netmask:"{mask=$2}
-                $1=="Address:"{addr=$2}
-                $1=="Network:"{addr=substr($2, 0, index($2, "/") - 1)}
-                $0==""{exit}
-                END{print addr "/" mask}
-            ' |
-            cat
+            addr=${i%%/*}
+            bits=32
+            [[ $i = */* ]] && bits=${i##*/}
+            # normalize address: '10/8' -> 10.0.0.0
+            n=0; a=
+            for o in ${addr//./ }; do
+                [[ $o =~ ^[0-9]+$ ]] ||
+                    { echo "error: bad address '$i'" >&2; exit 1; }
+                ((n < 4)) && a+=.$o
+                ((n++))
+            done
+            while ((n < 4)); do a+=.0; ((n++)); done
+            a=${a#.}
+            # prefix -> dotted netmask
+            mask=
+            for((o = 1; o <= 4; o++)); do
+                p=$(( (o - 1) * 8 ))
+                m=0
+                if   ((o*8 <= bits));      then m=255
+                elif ((p < bits && bits < p + 8)); then m=$((256 - 2**(8 - bits % 8)))
+                fi
+                mask+=.$m
+            done
+            mask=${mask#.}
+            # normalize to the network address: 10.0.0.7/10 -> 10.0.0.0
+            ia=0; im=0
+            for o in ${a//./ }; do ((ia = ia*256 + o)); done
+            for o in ${mask//./ }; do ((im = im*256 + o)); done
+            na=$((ia & im))
+            a=$((na >> 24 & 255)).$((na >> 16 & 255)).$((na >> 8 & 255)).$((na & 255))
+            echo "$a/$mask"
         done
     }
     x=( $(f "${x[@]}") )
@@ -137,7 +163,12 @@ set_xs(){
 }
 
 set_env(){
-    WSL2_IP=$(hostname -I | cut -d' ' -f1)
+    # 'hostname -I' is not portable (e.g. Arch uses inetutils hostname).
+    WSL2_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oPm1 'src \K[\d.]+')
+    [[ -z $WSL2_IP ]] &&
+        WSL2_IP=$(hostname -I 2>/dev/null | cut -d' ' -f1)
+    [[ -z $WSL2_IP ]] &&
+        { echo 'error: cannot detect the WSL2 IP address.' >&2; exit 1; }
 
     WIN_VIFIP=$(ip r s default | cut -d' ' -f3)
     WIN_VIFID=$(arp.exe -a -N $WIN_VIFIP | grep -aoPm1 '0x[0-9a-f]+' |
@@ -181,7 +212,7 @@ route_del(){
 }
 
 sshuttle_cmd(){
-    printf '%q ' sshuttle -l 0.0.0.0:0 "${args[@]}" ${rip:+-x $rip}
+    printf '%q ' sshuttle -l 0.0.0.0:0 "${args[@]}"
     echo
 }
 
@@ -190,7 +221,7 @@ main(){
         help
         exit 0
     elif [[ "$*" =~ --version ]];  then
-        echo 0.0.8
+        echo 0.0.9
         exit 0
     elif [[ "$*" =~ --upgrade ]];  then
         url=https://raw.githubusercontent.com/yabeenico/wsshuttle/main/wsshuttle
@@ -199,8 +230,9 @@ main(){
         exit 0
     fi
 
-    set_env
-    parse_args "$@" # args, rip, IS_DELETE, IS_DRY
+    parse_args "$@" # args, IS_DELETE, IS_DRY
+    check_deps
+    set_env         # WSL2_IP, WIN_VIFID, GW_IP, WIN_IFID
     set_xs          # x, s
 
     if [[ $IS_DELETE = 1 ]]; then
