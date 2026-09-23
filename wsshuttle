@@ -18,6 +18,16 @@ DESCRIPTION
     Since it modifies the routing table of Windows,
     the admin privilege of Windows is required.
     (Open WSL2 terminal with "Run as Administrator")
+    Excluded hosts are routed through their currently-resolved best route
+    (e.g. an OpenVPN route is preserved), falling back to the Windows
+    default gateway when no route covers them. Pre-existing routes on the
+    tunneled subnets are left intact, and only the routes added by
+    wsshuttle are removed on cleanup.
+    While running, wsshuttle temporarily lowers the interface metric of
+    the WSL vEthernet (e.g. 5000 -> 5), otherwise the tunneled subnet
+    routes would lose to competing routes like OpenVPN's: Windows adds
+    the interface metric to the route metric. The previous value is
+    restored on exit.
 OPTIONS
     --delete:       Delete the entries of routing table.
     --dry:          Just print commands to run, don't make any changes.
@@ -27,8 +37,8 @@ OPTIONS
 EXAMPLES
     wsshuttle -r ssh-server -x 157.0.0.0/8 0/0
         Route all (0/0) packets through ssh-server except destination is
-        157.0.0.0/8. And it excludes 'IP address of ssh-server' too by
-        specifying -x 'IP address of ssh-server' automatically.
+        157.0.0.0/8. Specify the IP address of ssh-server in -x as well,
+        otherwise it will be tunneled too.
     wsshuttle -r ssh-server --exclude 157.0.0.0/8 0/0
         Same as above, but with the long option '--exclude'.
         Short (-x, -r, -l, -e, -i) and long (--exclude, --include, --listen,
@@ -171,23 +181,113 @@ set_env(){
         { echo 'error: cannot detect the WSL2 IP address.' >&2; exit 1; }
 
     WIN_VIFIP=$(ip r s default | cut -d' ' -f3)
-    WIN_VIFID=$(arp.exe -a -N $WIN_VIFIP | grep -aoPm1 '0x[0-9a-f]+' |
-        awk '$0=strtonum($0)')
+    WIN_VIFID=$(ifip2id $WIN_VIFIP)
 
     GW_IP=$(route.exe print -4 | awk '$1=="0.0.0.0"{print $3}')
 
     WIN_IFIP=$(route.exe print -4 | awk '$1=="0.0.0.0"{print $4}')
-    WIN_IFID=$(arp.exe -a -N $WIN_IFIP | grep -aoPm1 '0x[0-9a-f]+' |
-        awk '$0=strtonum($0)')
+    WIN_IFID=$(ifip2id $WIN_IFIP)
 
     #show WSL2_IP WIN_VIFID GW_IP WIN_IFID
 }
 
+ifip2id(){ # echo the interface index of the interface which has the IP
+    # '</dev/null' because Windows exe's may consume stdin, which
+    # would eat the rest of the input of a calling 'while read' loop.
+    arp.exe -a -N $1 </dev/null |
+        grep -aoPm1 '0x[0-9a-f]+' | awk '$0=strtonum($0)'
+}
+
+ip2int(){ # convert a dotted decimal IPv4 address to an integer
+    local o n=0
+    for o in ${1//./ }; do ((n = n * 256 + o)); done
+    echo $n
+}
+
+best_route(){ # $1: IP. Print '<gateway> <ifid>' of the longest-prefix-match
+              # route covering it from 'route.exe print -4'.
+              # 'On-link' gateways are resolved to the interface IP.
+              # Routes whose gateway is the WSL2 IP are skipped: those are
+              # the tunnel routes added by wsshuttle itself, which would
+              # otherwise be picked when the tunnel is already up.
+              # Print nothing when no route covers the IP.
+    local ip=$1 ipn d mn gw ifip metric m best_m=-1 best_mt= row
+    ipn=$(ip2int $ip)
+    while read -r d mn gw ifip metric; do
+        m=$(ip2int $mn)
+        (((ipn & m) == $(ip2int $d))) || continue # not covering the IP
+        if ((m > best_m)) || ((m == best_m && metric < best_mt)); then
+            id=$(ifip2id $ifip)
+            [[ -n $id ]] || continue # e.g. the loopback interface
+            [[ $gw = On-link ]] && gw=$ifip
+            [[ $gw = $WSL2_IP ]] && continue # our own tunnel route
+            best_m=$m; best_mt=$metric
+            row="$gw $id"
+        fi
+    done < <(route.exe print -4 | tr -d '\r' |
+             awk 'NF == 5 && $1 ~ /^[0-9]+\./ && $2 ~ /^[0-9]+\./')
+    [[ -n $row ]] && echo $row
+}
+
+resolve_x(){ # For each exclude, resolve the gateway/if of the current best
+             # route covering it, and record them (xgw/xif, parallel to x)
+             # so route_add and route_del (incl. the traps) use the same
+             # per-exclude gateway. Fall back to the Windows default
+             # gateway when no route covers the exclude.
+    local i addr gw
+    xgw=(); xif=()
+    for i in "${x[@]}"; do
+        addr=${i%%/*}
+        gw=$(best_route $addr) # '<gateway> <ifid>' or empty
+        if [[ -n $gw ]]; then
+            xgw+=("${gw% *}"); xif+=("${gw#* }")
+        else
+            xgw+=("$GW_IP"); xif+=("$WIN_IFID")
+        fi
+    done
+    #show x xgw xif
+}
+
+vif_metric_low(){ # Temporarily lower the interface metric of the WSL
+                  # vEthernet: Windows adds the interface metric (often 5000
+                  # for the WSL vEthernet) to our route metric 1, which
+                  # would make the tunneled subnet routes lose against e.g.
+                  # OpenVPN routes. The previous value is saved and restored
+                  # on cleanup by vif_metric_restore.
+    local r
+    r=$(powershell.exe -NonInteractive -NoProfile -Command '
+        $i = Get-NetIPInterface -InterfaceIndex '"$WIN_VIFID"' -AddressFamily IPv4
+        "{0}|{1}" -f $i.InterfaceMetric, $i.AutomaticMetric' 2>/dev/null | tr -d '\r')
+    VIF_METRIC_PREV=${r%%|*}
+    VIF_AUTO_PREV=${r#*|}
+    [[ $VIF_METRIC_PREV =~ ^[0-9]+$ ]] || VIF_METRIC_PREV= # unparsable: nothing to restore
+    powershell.exe -NonInteractive -NoProfile -Command \
+        "Set-NetIPInterface -InterfaceIndex $WIN_VIFID -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 5" \
+        &>/dev/null
+    #show VIF_METRIC_PREV VIF_AUTO_PREV
+}
+
+vif_metric_restore(){ # Restore the interface metric saved by vif_metric_low.
+    [[ -n $VIF_METRIC_PREV ]] || return 0
+    if [[ $VIF_AUTO_PREV = True ]]; then
+        powershell.exe -NonInteractive -NoProfile -Command \
+            "Set-NetIPInterface -InterfaceIndex $WIN_VIFID -AddressFamily IPv4 -AutomaticMetric Enabled" \
+            &>/dev/null
+    else
+        powershell.exe -NonInteractive -NoProfile -Command \
+            "Set-NetIPInterface -InterfaceIndex $WIN_VIFID -AddressFamily IPv4 -InterfaceMetric $VIF_METRIC_PREV" \
+            &>/dev/null
+    fi
+    VIF_METRIC_PREV=
+}
+
 route_add(){
+    local i j=0 addr mask
     for i in "${x[@]}"; do
         addr=${i%%/*}
         mask=${i##*/}
-        echo route.exe add $addr mask $mask $GW_IP   metric 1 if $WIN_IFID
+        echo route.exe add $addr mask $mask ${xgw[$j]} metric 1 if ${xif[$j]}
+        ((j++))
     done
 
     for i in "${s[@]}"; do
@@ -198,16 +298,21 @@ route_add(){
 }
 
 route_del(){
+    local i j=0 addr mask
     for i in "${x[@]}"; do
         addr=${i%%/*}
         mask=${i##*/}
-        echo route.exe delete $addr mask $mask
+        # delete only the route we added, by its gateway. In --delete mode
+        # (standalone cleanup) the gateways resolved at setup time are
+        # unknown, so fall back to the Windows default gateway.
+        echo route.exe delete $addr mask $mask ${xgw[$j]:-$GW_IP} if ${xif[$j]:-$WIN_IFID}
+        ((j++))
     done
 
     for i in "${s[@]}"; do
         addr=${i%%/*}
         mask=${i##*/}
-        echo route.exe delete $addr mask $mask
+        echo route.exe delete $addr mask $mask $WSL2_IP if $WIN_VIFID
     done
 }
 
@@ -221,10 +326,10 @@ main(){
         help
         exit 0
     elif [[ "$*" =~ --version ]];  then
-        echo 0.0.9
+        echo 0.1.1
         exit 0
     elif [[ "$*" =~ --upgrade ]];  then
-        url=https://raw.githubusercontent.com/yabeenico/wsshuttle/main/wsshuttle
+        url=https://raw.githubusercontent.com/vchirikov/wsshuttle/main/wsshuttle
         (echo wget $url -O "'$0'"; echo chmod +x "'$0'") |
         ([[ "$*" =~ --dry ]] && cat || bash)
         exit 0
@@ -234,6 +339,7 @@ main(){
     check_deps
     set_env         # WSL2_IP, WIN_VIFID, GW_IP, WIN_IFID
     set_xs          # x, s
+    [[ $IS_DELETE = 1 ]] || resolve_x # xgw, xif (per-exclude gateway/if)
 
     if [[ $IS_DELETE = 1 ]]; then
         if [[ $IS_DRY = 1 ]]; then
@@ -247,16 +353,19 @@ main(){
             sshuttle_cmd
             route_del | column -t
         else
+            vif_metric_low
             route_del | powershell.exe -NonInteractive -NoProfile - &>/dev/null
             route_add | powershell.exe -NonInteractive -NoProfile - |
                 grep -av OK
             if [[ $? != 0 ]]; then # if route.exe add success
                 trap '
+                    vif_metric_restore
                     route_del |
                     powershell.exe -NonInteractive -NoProfile - &>/dev/null &
                     exit
                 ' 2
                 trap '
+                    vif_metric_restore
                     route_del |
                     powershell.exe -NonInteractive -NoProfile - &>/dev/null &
                     exit 1
