@@ -12,7 +12,28 @@ Routing behavior:
   the Windows default gateway is used as fallback.
 - Pre-existing routes on the tunneled subnets are left intact: wsshuttle
   only adds its own routes (metric 1, so they win), and on cleanup
-  deletes only the routes it added itself (by specifying the gateway).
+  deletes only the routes it added itself (tracked per-session; an
+  exclude whose route already exists, e.g. an OpenVPN one, is skipped
+  instead of being duplicated, so cleanup can never delete the foreign
+  route).
+- A state file (~/.cache/wsshuttle/session) records the routes added and
+  the saved vEthernet metric of the running session. If a previous run
+  crashed, its leftovers are removed at startup (and listed by
+  `--delete --dry`): routes are deleted by their recorded
+  gateway/interface and the metric is restored before a new value is
+  saved. Stale tunnel routes left by a crashed run whose WSL2 IP has
+  changed since (not matched by the recorded gateway) are matched by the
+  WSL vEthernet interface and removed as well, so they cannot accumulate.
+- An exclude whose route already exists (e.g. an OpenVPN one) is skipped
+  only when that route works, i.e. its gateway belongs to the subnet of
+  the interface it is pinned to. Broken leftovers (e.g. after OpenVPN
+  reconnects re-arrange the TAP adapters) are deleted and replaced with
+  correct routes; broken routes are skipped when resolving the best
+  route for an exclude as well.
+- A simple lock prevents running two wsshuttle sessions concurrently.
+- Cleanup runs synchronously on every exit path: sshuttle dropping or
+  timing out, Ctrl+C, SIGTERM/HUP, or a failed `route.exe add`. The
+  lowered vEthernet interface metric is restored as well.
 
 # Requirements
 - iproute2 (`ip`), util-linux (`column`)

@@ -28,6 +28,16 @@ DESCRIPTION
     routes would lose to competing routes like OpenVPN's: Windows adds
     the interface metric to the route metric. The previous value is
     restored on exit.
+    The added routes and the saved vEthernet metric are recorded in a
+    state file (~/.cache/wsshuttle/session), so a crashed previous
+    session is cleaned up at startup: its routes are deleted and the
+    metric restored before a new value is saved.
+    An exclude whose route already exists is skipped only when that
+    route works, i.e. its gateway belongs to the subnet of the pinned
+    interface. Broken leftovers (e.g. after OpenVPN reconnects re-arrange
+    the TAP adapters) are deleted and replaced with correct routes; they
+    are skipped when resolving the best route for an exclude as well.
+    A simple lock prevents running two wsshuttle sessions concurrently.
 OPTIONS
     --delete:       Delete the entries of routing table.
     --dry:          Just print commands to run, don't make any changes.
@@ -60,6 +70,11 @@ show(){
     exit 0
 }
 #r=aa; x=(bb cc); s=(dd ee); show r x s; exit
+
+STATE_DIR=~/.cache/wsshuttle
+STATE_FILE=$STATE_DIR/session
+LOCK_FILE=$STATE_DIR/lock
+LOCKED=
 
 parse_args(){
     args=()
@@ -183,9 +198,9 @@ set_env(){
     WIN_VIFIP=$(ip r s default | cut -d' ' -f3)
     WIN_VIFID=$(ifip2id $WIN_VIFIP)
 
-    GW_IP=$(route.exe print -4 | awk '$1=="0.0.0.0"{print $3}')
+    GW_IP=$(route.exe print -4 | awk '$1=="0.0.0.0" && $2=="0.0.0.0"{print $3; exit}')
 
-    WIN_IFIP=$(route.exe print -4 | awk '$1=="0.0.0.0"{print $4}')
+    WIN_IFIP=$(route.exe print -4 | awk '$1=="0.0.0.0" && $2=="0.0.0.0"{print $4; exit}')
     WIN_IFID=$(ifip2id $WIN_IFIP)
 
     #show WSL2_IP WIN_VIFID GW_IP WIN_IFID
@@ -221,6 +236,7 @@ best_route(){ # $1: IP. Print '<gateway> <ifid>' of the longest-prefix-match
             [[ -n $id ]] || continue # e.g. the loopback interface
             [[ $gw = On-link ]] && gw=$ifip
             [[ $gw = $WSL2_IP ]] && continue # our own tunnel route
+            gw_ok $gw $ifip || continue # broken route: gw is not on if subnet
             best_m=$m; best_mt=$metric
             row="$gw $id"
         fi
@@ -229,9 +245,42 @@ best_route(){ # $1: IP. Print '<gateway> <ifid>' of the longest-prefix-match
     [[ -n $row ]] && echo $row
 }
 
+route_rows(){ # print '<gateway> <ifip>' rows of 'route.exe print -4' whose
+              # network/mask match exactly $1/$2
+    route.exe print -4 </dev/null | tr -d '\r' |
+    awk -v d=$1 -v m=$2 '
+        NF == 5 && $1 == d && $2 == m &&
+        $1 ~ /^[0-9]+\./ && $2 ~ /^[0-9]+\./ {print $3, $4}'
+}
+
+ONLINK_MAP=
+onlink_map(){ # print 'ifip net mask' rows of the on-link subnets
+              # (from 'route.exe print -4'), cached in ONLINK_MAP
+    [[ -n $ONLINK_MAP ]] || ONLINK_MAP=$(route.exe print -4 </dev/null |
+        tr -d '\r' | awk 'NF == 5 && $3 == "On-link" &&
+            $1 ~ /^[0-9]+\./ && $2 ~ /^[0-9]+\./ {print $4, $1, $2}')
+    echo "$ONLINK_MAP"
+}
+
+gw_ok(){ # true when the route gateway $1 is reachable via the interface IP
+         # $2, i.e. it is 'On-link' or lies within the interface's subnet.
+         # Detects stale routes whose pinned interface no longer has that
+         # gateway (e.g. after OpenVPN reconnects swap the TAP adapters).
+    local gw=$1 ifip=$2 on net mask seen=
+    [[ -n $gw && -n $ifip ]] || return 1 # empty row: nothing to verify
+    [[ $gw = On-link ]] && return 0
+    while read -r on net mask; do
+        [[ $on = $ifip ]] || continue
+        seen=1
+        (( ($(ip2int $gw) & $(ip2int $mask)) == $(ip2int $net) )) && return 0
+    done < <(onlink_map)
+    [[ -n $seen ]] || return 0 # subnet of the interface unknown: assume ok
+    return 1
+}
+
 resolve_x(){ # For each exclude, resolve the gateway/if of the current best
              # route covering it, and record them (xgw/xif, parallel to x)
-             # so route_add and route_del (incl. the traps) use the same
+             # so route_add and route_del_cleanup (incl. the traps) use the same
              # per-exclude gateway. Fall back to the Windows default
              # gateway when no route covers the exclude.
     local i addr gw
@@ -254,13 +303,23 @@ vif_metric_low(){ # Temporarily lower the interface metric of the WSL
                   # would make the tunneled subnet routes lose against e.g.
                   # OpenVPN routes. The previous value is saved and restored
                   # on cleanup by vif_metric_restore.
-    local r
-    r=$(powershell.exe -NonInteractive -NoProfile -Command '
-        $i = Get-NetIPInterface -InterfaceIndex '"$WIN_VIFID"' -AddressFamily IPv4
-        "{0}|{1}" -f $i.InterfaceMetric, $i.AutomaticMetric' 2>/dev/null | tr -d '\r')
-    VIF_METRIC_PREV=${r%%|*}
-    VIF_AUTO_PREV=${r#*|}
-    [[ $VIF_METRIC_PREV =~ ^[0-9]+$ ]] || VIF_METRIC_PREV= # unparsable: nothing to restore
+    local r try
+    for try in 1 2 3; do
+        r=$(powershell.exe -NonInteractive -NoProfile -Command '
+            $i = Get-NetIPInterface -InterfaceIndex '"$WIN_VIFID"' -AddressFamily IPv4
+            "{0}|{1}" -f $i.InterfaceMetric, $i.AutomaticMetric' 2>/dev/null | tr -d '\r')
+        VIF_METRIC_PREV=${r%%|*}
+        VIF_AUTO_PREV=${r#*|}
+        [[ $VIF_METRIC_PREV =~ ^[0-9]+$ ]] && break
+        VIF_METRIC_PREV=
+        sleep 1
+    done
+    if [[ -z $VIF_METRIC_PREV ]]; then
+        # Cannot read the previous state: do not touch the metric at all,
+        # otherwise there would be nothing to restore on cleanup.
+        echo 'warning: cannot read the vEthernet metric, not lowering it.' >&2
+        return 1
+    fi
     powershell.exe -NonInteractive -NoProfile -Command \
         "Set-NetIPInterface -InterfaceIndex $WIN_VIFID -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 5" \
         &>/dev/null
@@ -269,7 +328,9 @@ vif_metric_low(){ # Temporarily lower the interface metric of the WSL
 
 vif_metric_restore(){ # Restore the interface metric saved by vif_metric_low.
     [[ -n $VIF_METRIC_PREV ]] || return 0
-    if [[ $VIF_AUTO_PREV = True ]]; then
+    # Windows reports automatic metric as 'True' (older builds) or
+    # 'Enabled' (newer ones) — accept both.
+    if [[ $VIF_AUTO_PREV = True || $VIF_AUTO_PREV = Enabled ]]; then
         powershell.exe -NonInteractive -NoProfile -Command \
             "Set-NetIPInterface -InterfaceIndex $WIN_VIFID -AddressFamily IPv4 -AutomaticMetric Enabled" \
             &>/dev/null
@@ -281,12 +342,121 @@ vif_metric_restore(){ # Restore the interface metric saved by vif_metric_low.
     VIF_METRIC_PREV=
 }
 
-route_add(){
-    local i j=0 addr mask
+lock_acquire(){ # Lock is a plain file with the PID inside. Creation is
+                # atomic thanks to noclobber: 'echo >file' fails when the
+                # file already exists. No -rf, no force anywhere.
+    mkdir -p $STATE_DIR
+    if (set -o noclobber; echo $$ >$LOCK_FILE) 2>/dev/null; then
+        LOCKED=1
+    else
+        local pid=$(cat $LOCK_FILE 2>/dev/null)
+        if [[ -n $pid ]] && kill -0 $pid 2>/dev/null; then
+            echo "error: another wsshuttle session is running (pid $pid)." >&2
+            exit 1
+        fi
+        rm $LOCK_FILE 2>/dev/null # stale lock of a dead session
+        (set -o noclobber; echo $$ >$LOCK_FILE) 2>/dev/null || {
+            echo 'error: cannot acquire the lock.' >&2
+            exit 1
+        }
+        LOCKED=1
+    fi
+}
+
+lock_release(){
+    [[ $LOCKED = 1 ]] || return 0
+    rm $LOCK_FILE 2>/dev/null
+    LOCKED=
+}
+
+state_write(){ # Persist the added routes and the saved vEthernet metric,
+               # so a crashed session can be cleaned up at the next start.
+    local f=$STATE_DIR/session.tmp r
+    mkdir -p $STATE_DIR
+    {
+        [[ -n $VIF_METRIC_PREV ]] && {
+            echo "VMETRIC=$VIF_METRIC_PREV"
+            echo "VAUTO=$VIF_AUTO_PREV"
+        }
+        for r in "${added[@]}"; do echo "R $r"; done
+    } >$f
+    mv $f $STATE_FILE
+}
+
+state_del_cmds(){ # Print the delete commands recorded in the state file
+                  # (the routes added by a previous crashed session).
+    [[ -f $STATE_FILE ]] || return 0
+    local r addr mask gw ifid
+    while read -r r; do
+        [[ $r = 'R '* ]] || continue
+        IFS='|' read -r addr mask gw ifid <<<"${r#R }"
+        echo route.exe delete $addr mask $mask $gw if $ifid
+    done <$STATE_FILE
+}
+
+state_cleanup(){ # Delete the routes left by a previous crashed session
+                 # (recorded in the state file) and restore its vEthernet
+                 # metric. Must run BEFORE vif_metric_low, so that the
+                 # leaked metric is not saved as the original one.
+    [[ -f $STATE_FILE ]] || return 0
+    state_del_cmds | powershell.exe -NonInteractive -NoProfile - &>/dev/null
+    vm=$(sed -n 's/^VMETRIC=//p' $STATE_FILE)
+    va=$(sed -n 's/^VAUTO=//p' $STATE_FILE)
+    if [[ $vm =~ ^[0-9]+$ ]]; then
+        VIF_METRIC_PREV=$vm VIF_AUTO_PREV=$va
+        vif_metric_restore
+    fi
+    rm $STATE_FILE 2>/dev/null
+}
+
+route_del_stale(){ # Delete stale tunnel routes left behind by a crashed run
+                   # whose WSL2 IP has changed since: the state-file deletes
+                   # are scoped by the recorded gateway and do not match
+                   # such routes. Only routes on the WSL vEthernet interface
+                   # are matched, foreign routes (e.g. OpenVPN's) are never
+                   # touched.
+    local i addr mask gw ifip id
+    for i in "${s[@]}"; do
+        addr=${i%%/*}
+        mask=${i##*/}
+        while read -r gw ifip; do
+            [[ $gw != $WIN_VIFIP ]] || continue # not an on-link-style route
+            id=$(ifip2id $ifip)
+            [[ $id = $WIN_VIFID ]] || continue # only our own tunnel routes
+            echo route.exe delete $addr mask $mask $gw if $id
+        done < <(route_rows $addr $mask)
+    done
+}
+
+route_add(){ # Record every route actually added in added[] ('addr|mask|gw|if'),
+             # so cleanup deletes exactly those and never a foreign route.
+             # An exclude whose route already exists and works (its gateway
+             # belongs to the subnet of its interface, e.g. an OpenVPN one)
+             # is skipped. A broken leftover (e.g. pinned to a TAP interface
+             # that no longer has that gateway) is deleted and replaced
+             # with a correct route.
+    added=()
+    local i j=0 addr mask rows gw ifip id exists
     for i in "${x[@]}"; do
         addr=${i%%/*}
         mask=${i##*/}
+        rows=$(route_rows $addr $mask)
+        exists=
+        while read -r gw ifip; do
+            [[ -n $gw ]] || continue # empty rows= (no route): nothing to do
+            if gw_ok $gw $ifip; then
+                exists=1 # a working foreign route exists: don't re-add
+            else # delete a broken leftover (e.g. stale wsshuttle route
+                id=$(ifip2id $ifip) # pinned to a swapped TAP adapter)
+                [[ -n $id ]] &&
+                    echo route.exe delete $addr mask $mask $gw if $id
+            fi
+        done <<<"$rows"
+        if [[ -n $exists ]]; then
+            ((j++)); continue
+        fi
         echo route.exe add $addr mask $mask ${xgw[$j]} metric 1 if ${xif[$j]}
+        added+=("$addr|$mask|${xgw[$j]}|${xif[$j]}")
         ((j++))
     done
 
@@ -294,25 +464,17 @@ route_add(){
         addr=${i%%/*}
         mask=${i##*/}
         echo route.exe add $addr mask $mask $WSL2_IP metric 1 if $WIN_VIFID
+        added+=("$addr|$mask|$WSL2_IP|$WIN_VIFID")
     done
 }
 
-route_del(){
-    local i j=0 addr mask
-    for i in "${x[@]}"; do
-        addr=${i%%/*}
-        mask=${i##*/}
-        # delete only the route we added, by its gateway. In --delete mode
-        # (standalone cleanup) the gateways resolved at setup time are
-        # unknown, so fall back to the Windows default gateway.
-        echo route.exe delete $addr mask $mask ${xgw[$j]:-$GW_IP} if ${xif[$j]:-$WIN_IFID}
-        ((j++))
-    done
-
-    for i in "${s[@]}"; do
-        addr=${i%%/*}
-        mask=${i##*/}
-        echo route.exe delete $addr mask $mask $WSL2_IP if $WIN_VIFID
+route_del_cleanup(){ # Delete exactly the routes added by route_add in this
+                     # session (recorded in added[]), so pre-existing
+                     # foreign routes are never touched.
+    local r addr mask gw ifid
+    for r in "${added[@]}"; do
+        IFS='|' read -r addr mask gw ifid <<<"$r"
+        echo route.exe delete $addr mask $mask $gw if $ifid
     done
 }
 
@@ -321,12 +483,25 @@ sshuttle_cmd(){
     echo
 }
 
+cleanup(){ # Restore the vEthernet metric and delete exactly the routes
+           # added by this session. Never touches foreign routes
+           # (e.g. OpenVPN's), so it is safe to run at any point.
+           # Runs synchronously: a backgrounded cleanup may not finish
+           # before the script exits, leaving the routes behind.
+    trap '' 1 2 3 15 # ignore signals while cleaning up (incl. 2nd Ctrl+C)
+    vif_metric_restore
+    route_del_cleanup |
+        powershell.exe -NonInteractive -NoProfile - &>/dev/null
+    rm $STATE_FILE 2>/dev/null # the routes were just deleted: the state is stale
+    lock_release
+}
+
 main(){
     if [[ "$*" =~ --help ]];  then
         help
         exit 0
     elif [[ "$*" =~ --version ]];  then
-        echo 0.1.1
+        echo 0.2.1
         exit 0
     elif [[ "$*" =~ --upgrade ]];  then
         url=https://raw.githubusercontent.com/vchirikov/wsshuttle/main/wsshuttle
@@ -343,37 +518,60 @@ main(){
 
     if [[ $IS_DELETE = 1 ]]; then
         if [[ $IS_DRY = 1 ]]; then
-            route_del | column -t
+            (state_del_cmds; route_del_stale) | column -t
         else
-            route_del | powershell.exe -NonInteractive -NoProfile -
+            lock_acquire
+            state_cleanup # leftovers of a previous crashed session
+            route_del_stale | powershell.exe -NonInteractive -NoProfile -
+            lock_release
         fi
     else
         if [[ $IS_DRY = 1 ]]; then
-            (route_del; route_add) | column -t
+            # Preview what a real run would do: cleanup of stale routes,
+            # then the adds; teardown mirrors route_del_cleanup (only the
+            # routes that route_add actually added).
+            tmpf=$(mktemp)
+            route_add >$tmpf # also fills added[] for the teardown preview
+            { route_del_stale; cat $tmpf; } | column -t
+            rm $tmpf 2>/dev/null
             sshuttle_cmd
-            route_del | column -t
+            route_del_cleanup | column -t
         else
+            # Install the traps BEFORE touching anything, so that even a
+            # Ctrl+C between vif_metric_low and route_add restores the state.
+            trap 'cleanup; exit 130' 2
+            trap 'cleanup; exit 1' 1 3 15
+
+            lock_acquire
+            # Remove the leftovers of a previous crashed session (routes
+            # and the vEthernet metric) BEFORE saving the new metric:
+            # otherwise the leaked value would be saved and restored later.
+            state_cleanup
             vif_metric_low
-            route_del | powershell.exe -NonInteractive -NoProfile - &>/dev/null
-            route_add | powershell.exe -NonInteractive -NoProfile - |
-                grep -av OK
-            if [[ $? != 0 ]]; then # if route.exe add success
-                trap '
-                    vif_metric_restore
-                    route_del |
-                    powershell.exe -NonInteractive -NoProfile - &>/dev/null &
-                    exit
-                ' 2
-                trap '
-                    vif_metric_restore
-                    route_del |
-                    powershell.exe -NonInteractive -NoProfile - &>/dev/null &
-                    exit 1
-                ' 1 3 15
-                sshuttle_cmd
-                sshuttle_cmd | bash
-                kill $$
+            # Remove stale tunnel routes possibly left by a previous crashed
+            # run, even when the WSL2 IP has changed since.
+            route_del_stale |
+                powershell.exe -NonInteractive -NoProfile - &>/dev/null
+
+            tmpf=$(mktemp)
+            route_add >$tmpf # also fills added[] with the routes to clean up
+            if [[ -s $tmpf ]] &&
+               powershell.exe -NonInteractive -NoProfile - <$tmpf |
+               grep -av OK; then # some route.exe add failed
+                rm $tmpf 2>/dev/null
+                cleanup # restore the metric, remove what was added
+                exit 1
             fi
+            rm $tmpf 2>/dev/null
+            state_write # persist added[] + the metric for crash recovery
+
+            sshuttle_cmd
+            sshuttle_cmd | bash
+            rc=$? # the exit code of sshuttle
+            # sshuttle exited on its own (timeout, drop, ...): restore
+            # everything synchronously, don't rely on traps or background.
+            cleanup
+            exit $rc
         fi
     fi
 }
